@@ -1,0 +1,14 @@
+# Ignore Object files (compilation artifacts)
+*.o
+
+# Ignore Editor backup files
+*~
+*.swp
+.DS_Store
+
+# Ignore Compiled Binaries (The actors and the shell)
+tsh
+myspin
+mysplit
+mystop
+myint
