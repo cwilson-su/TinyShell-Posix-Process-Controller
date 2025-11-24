@@ -1,7 +1,7 @@
 /* 
  * tsh - A tiny shell program with job control
  * 
- * <Put your name and login ID here>
+ * Author: cwilson-su
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +165,47 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+    char *argv[MAXARGS]; /* Argument list execve() */
+    char buf[MAXLINE];   /* Holds modified command line */
+    int bg;              /* Should the job run in bg or fg? */
+    pid_t pid;           /* Process ID */
+
+    strcpy(buf, cmdline);
+    bg = parseline(buf, argv); // Parses the line, fills argv, returns bg status
+
+    if (argv[0] == NULL)
+        return;   /* Ignore empty lines */
+
+    // Attempt to execute as a built-in command first
+    if (!builtin_cmd(argv)) {
+        // If we get here, it means it wasn't a built-in command.
+        
+        // --- Step 1: Fork a child process ---
+        if ((pid = fork()) == 0) { // Child process
+            // --- Step 2: Execute the new program ---
+            // execve replaces the current process image with the new program.
+            // If it returns, it means an error occurred (e.g. command not found).
+            if (execve(argv[0], argv, environ) < 0) {
+                printf("%s: Command not found\n", argv[0]);
+                exit(0);
+            }
+        }
+
+        // --- Step 3: Parent waits (Foreground only) ---
+        /* Parent runs this code */
+        if (!bg) {
+            // For Trace 03, we wait directly for this specific child.
+            int status;
+            if (waitpid(pid, &status, 0) < 0)
+                unix_error("waitpid error");
+        }
+        else {
+            // Background Job (Trace 04 preparation)
+            printf("%d %s", pid, cmdline);
+        }
+
+    }
+    
     return;
 }
 
@@ -231,6 +272,16 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+    // Ensure the command isn't empty
+    if (argv[0] == NULL) {
+        return 1; // Ignore empty lines
+    }
+
+    // Task 1: Handle the "quit" command
+    if (strcmp(argv[0], "quit") == 0) {
+        exit(0); // Terminate the shell immediately
+    }
+
     return 0;     /* not a builtin command */
 }
 
