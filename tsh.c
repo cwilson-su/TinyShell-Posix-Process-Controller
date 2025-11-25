@@ -165,47 +165,58 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
-    char *argv[MAXARGS]; /* Argument list execve() */
-    char buf[MAXLINE];   /* Holds modified command line */
-    int bg;              /* Should the job run in bg or fg? */
-    pid_t pid;           /* Process ID */
+    char *argv[MAXARGS];
+    char buf[MAXLINE];
+    int bg;
+    pid_t pid;
+    
+    // Signals masks (Course 6, Page 70)
+    sigset_t mask_all, mask_one, prev_one;
 
     strcpy(buf, cmdline);
-    bg = parseline(buf, argv); // Parses the line, fills argv, returns bg status
+    bg = parseline(buf, argv); 
 
-    if (argv[0] == NULL)
-        return;   /* Ignore empty lines */
+    if (argv[0] == NULL) return;
 
-    // Attempt to execute as a built-in command first
     if (!builtin_cmd(argv)) {
-        // If we get here, it means it wasn't a built-in command.
-        
-        // --- Step 1: Fork a child process ---
-        if ((pid = fork()) == 0) { // Child process
-            // --- Step 2: Execute the new program ---
-            // execve replaces the current process image with the new program.
-            // If it returns, it means an error occurred (e.g. command not found).
+        // 1. Prepare masks
+        sigfillset(&mask_all);
+        sigemptyset(&mask_one);
+        sigaddset(&mask_one, SIGCHLD);
+
+        // 2. Block SIGCHLD before forking (Critical Section Start)
+        // This prevents a child from dying before we add it to the list.
+        sigprocmask(SIG_BLOCK, &mask_one, &prev_one); 
+
+        if ((pid = fork()) == 0) { 
+            // --- Child Process ---
+            // Unblock signals so the child can receive them!
+            sigprocmask(SIG_SETMASK, &prev_one, NULL); 
+            setpgid(0, 0); // Put child in new process group
+            
             if (execve(argv[0], argv, environ) < 0) {
                 printf("%s: Command not found\n", argv[0]);
                 exit(0);
             }
         }
 
-        // --- Step 3: Parent waits (Foreground only) ---
-        /* Parent runs this code */
-        if (!bg) {
-            // For Trace 03, we wait directly for this specific child.
-            int status;
-            if (waitpid(pid, &status, 0) < 0)
-                unix_error("waitpid error");
-        }
-        else {
-            // Background Job (Trace 04 preparation)
-            printf("%d %s", pid, cmdline);
-        }
+        // --- Parent Process ---
+        // 3. Add job to list (We are safe because SIGCHLD is blocked)
+        // (helper function provided in tsh.c, line 296)
+        if (!addjob(jobs, pid, bg ? BG : FG, cmdline))
+            return;
 
+        // 4. Unblock signals (Critical Section End)
+        sigprocmask(SIG_SETMASK, &prev_one, NULL); 
+
+        if (!bg) {
+            // Foreground: Wait for it
+            waitfg(pid); 
+        } else {
+            // Background: Print info [JID] (PID) Command
+            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+        }
     }
-    
     return;
 }
 
@@ -272,17 +283,20 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
-    // Ensure the command isn't empty
-    if (argv[0] == NULL) {
-        return 1; // Ignore empty lines
-    }
+    if (argv[0] == NULL) return 1;
 
-    // Task 1: Handle the "quit" command
     if (strcmp(argv[0], "quit") == 0) {
-        exit(0); // Terminate the shell immediately
+        exit(0);
     }
 
-    return 0;     /* not a builtin command */
+    // Task: Handle the "jobs" command
+    if (strcmp(argv[0], "jobs") == 0) {
+        // listjobs is a helper provided in the file (approx line 333)
+        listjobs(jobs); 
+        return 1;
+    }
+
+    return 0;     
 }
 
 /* 
@@ -298,6 +312,11 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    // While the pid is still in the Foreground (FG) state, sleep.
+    // fgpid(jobs) is a helper that returns the PID of the current FG job.
+    while (pid == fgpid(jobs)) {
+        sleep(1); // Sleep for 1 second before checking again
+    }
     return;
 }
 
@@ -314,6 +333,47 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    int olderrno = errno; // Save errno 
+    int status;
+    pid_t pid;
+    struct job_t *job;
+
+    // Reap children. 
+    // WNOHANG: Don't block waiting for running children.
+    // WUNTRACED: Also report stopped children (for Ctrl+Z).
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        
+        // Get the job struct to print correct JID
+        // (We must block signals here potentially, but we are in a handler, 
+        // so signals are implicitly blocked by the kernel for this type)
+        
+        // Case 1: Child terminated normally (exit)
+        if (WIFEXITED(status)) {
+            deletejob(jobs, pid);
+        }
+        
+        // Case 2: Child terminated by a signal (Ctrl+C / SIGINT)
+        else if (WIFSIGNALED(status)) {
+            job = getjobpid(jobs, pid);
+            if (job != NULL) {
+                printf("Job [%d] (%d) terminated by signal %d\n", 
+                    job->jid, pid, WTERMSIG(status));
+                deletejob(jobs, pid);
+            }
+        }
+        
+        // Case 3: Child stopped (Ctrl+Z / SIGTSTP)
+        else if (WIFSTOPPED(status)) {
+            job = getjobpid(jobs, pid);
+            if (job != NULL) {
+                job->state = ST; // Update state to STOPPED
+                printf("Job [%d] (%d) stopped by signal %d\n", 
+                    job->jid, pid, WSTOPSIG(status));
+            }
+        }
+    }
+
+    errno = olderrno; // Restore errno
     return;
 }
 
@@ -324,6 +384,20 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    int olderrno = errno; // Save errno
+    
+    // 1. Find the ID of the current foreground job
+    pid_t pid = fgpid(jobs);
+
+    // 2. If there is a foreground job...
+    if (pid != 0) {
+        // 3. Send the signal to the entire PROCESS GROUP (-pid)
+        if (kill(-pid, SIGINT) < 0) {
+            unix_error("sigint_handler: kill error");
+        }
+    }
+
+    errno = olderrno; // Restore errno
     return;
 }
 
@@ -334,6 +408,19 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    int olderrno = errno;
+    
+    pid_t pid = fgpid(jobs);
+
+    if (pid != 0) {
+        // Send SIGTSTP (Stop) to the process group
+        // (Course 6, Page 83)
+        if (kill(-pid, SIGTSTP) < 0) {
+            unix_error("sigtstp_handler: kill error");
+        }
+    }
+
+    errno = olderrno;
     return;
 }
 
